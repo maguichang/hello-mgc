@@ -1,0 +1,225 @@
+###故障预警的存储过程
+flag
+**
+BEGIN
+##最后参照history与lack表决定是否将数据写到result
+UPDATE eg_data_history_ma h1 set h1.flag1 = 0;
+UPDATE eg_data_history_ma h1,eg_data_history h2 set h1.flag1 = 1 WHERE h1.WTURBINE_ID=h2.WTURBINE_ID AND h1.UPLOAD_DATES!=h2.UPLOAD_DATES;
+#lack表处理逻辑
+UPDATE eg_data_lack_ma l1 set l1.flag2 = 0;
+##lack表
+DROP TABLE IF EXISTS lack;
+#CREATE TABLE lack(
+#ct VARCHAR(255));
+#INSERT into lack(ct) SELECT CONCAT(WTURBINE_ID,LACK_DATES) ct from eg_data_lack_ma l1 WHERE CONCAT(l1.WTURBINE_ID,l1.LACK_DATES) not in (SELECT CONCAT(l2.WTURBINE_ID,l2.LACK_DATES) from eg_data_lack l2);
+CREATE TABLE lack2 SELECT * FROM (SELECT CONCAT(WTURBINE_ID,LACK_DATES) ct from eg_data_lack_ma l1 WHERE CONCAT(l1.WTURBINE_ID,l1.LACK_DATES) not in (SELECT CONCAT(l2.WTURBINE_ID,l2.LACK_DATES) from eg_data_lack l2))m;
+
+END
+
+insert_result2
+***
+BEGIN
+##执行最后插入结果
+INSERT INTO eg_bus_alert_result(
+alert_name,
+alert_level,
+alert_desc,
+alert_location,
+alert_type,
+windfarm,
+alert_date,
+create_time,
+turbine,
+fault_code,
+rules_id) SELECT alert_name_ma,alert_level_ma1,alert_desc_ma,alert_location_ma,alert_type_ma,windfarm_id,alert_date_ma,create_time_ma,turbine,
+fault_code_ma,rules_id from ma WHERE alert_level_ma1 is not null;
+END
+########
+update_alert_new
+**
+BEGIN
+#更新result_all的存储过程
+
+#与new_alertlevel2组合使用
+
+###添加字段trigkey_count,每个trigkey的次数
+DELETE from result_all2 WHERE num1_trigkey is null;
+DROP TABLE if EXISTS result_all;
+CREATE TABLE result_all SELECT * from result_all2 ORDER BY num1_trigkey DESC;
+ALTER TABLE result_all ADD trigkey_count VARCHAR(2550);
+UPDATE result_all SET trigkey_count=CONCAT(trigkeys,'：',num1_trigkey,'次 ');
+############################开始更新result_all这个表
+UPDATE result_all SET alert_level_ma1=(case when num1_trigkey BETWEEN level1low and level1high then 1 when num1_trigkey BETWEEN level2low AND level2high then 2 when num1_trigkey>level3low then 3 END) WHERE sendtype=2;
+UPDATE result_all SET 
+alert_name_ma='故障预警',
+alert_type_ma=5,
+alert_location_ma=CONCAT(windfarm,'->',turbine),
+alert_desc_ma=CONCAT('<',rules_id,'>','近',faultDays,'天','，',windfarm,'，',turbine,'，',trigkeys,'：',num1_trigkey,'次， ',alert_level_ma1,'级预警'),
+alert_date_ma=DATE_FORMAT(NOW(),'%Y%m%d'),
+create_time_ma=NOW(),
+fault_code_ma=trigkey_count
+WHERE sendtype=2;
+
+#########################################################################################################################
+#####风机级别更新,借助中间表
+DROP TABLE IF EXISTS t_alert1;
+CREATE TABLE t_alert1 SELECT rules_id,windfarm_id,windfarm,turbine,turbine_id,trigkeys,level1low,level1high,level2low,level2high,level3low,alert_level_ma1,alert_level_ma2,
+alert_level_ma3,num1_trigkey,sum(num1_trigkey) g_num2_trigkey,num3_trigkey,alert_name_ma,alert_type_ma,alert_location_ma,alert_desc_ma,alert_date_ma,create_time_ma,fault_code_ma,
+sendtype FROM result_all WHERE sendtype=0 GROUP BY turbine_id;
+
+DROP TABLE IF EXISTS t_alert1_new;
+CREATE TABLE t_alert1_new SELECT * FROM result_all WHERE sendtype=0;
+
+UPDATE t_alert1 SET alert_level_ma1=(case when g_num2_trigkey BETWEEN level1low and level1high then 1 when g_num2_trigkey BETWEEN level2low AND level2high then 2 when g_num2_trigkey>level3low then 3 END) WHERE sendtype=0;
+ALTER TABLE t_alert1 add new_trigkeys2 VARCHAR(2550);
+
+###再借助中间表，完成trigkey的分组与更新
+DROP TABLE IF EXISTS t_alert1_new2;
+CREATE TABLE t_alert1_new2 SELECT rules_id,windfarm_id,turbine_id,GROUP_CONCAT(trigkey_count separator '|') cat_trigkey FROM t_alert1_new GROUP BY turbine_id;
+
+UPDATE t_alert1 tb1,t_alert1_new2 tb2 SET 
+tb1.new_trigkeys2=tb2.cat_trigkey WHERE tb1.rules_id=tb2.rules_id and tb1.windfarm_id=tb2.windfarm_id AND tb1.turbine_id=tb2.turbine_id;
+#####根据t_alert1更新result_all
+UPDATE result_all,t_alert1 SET 
+result_all.alert_level_ma1=t_alert1.alert_level_ma1,
+result_all.num2_trigkey=t_alert1.g_num2_trigkey,
+result_all.fault_code_ma=CONCAT(t_alert1.new_trigkeys2) WHERE result_all.rules_id=t_alert1.rules_id AND result_all.windfarm_id=t_alert1.windfarm_id AND result_all.turbine_id=t_alert1.turbine_id;
+#result_all.fault_code_ma=CONCAT(t_alert1.turbine_id,'|',t_alert1.new_trigkeys2) WHERE result_all.rules_id=t_alert1.rules_id AND result_all.windfarm_id=t_alert1.windfarm_id AND result_all.turbine_id=t_alert1.turbine_id;
+UPDATE result_all SET 
+alert_name_ma='故障预警',
+alert_type_ma=5,
+alert_location_ma=CONCAT(windfarm,'->',turbine),
+alert_desc_ma=CONCAT('<',rules_id,'>','近',faultDays,'天','，',windfarm,'，',turbine,'：',num2_trigkey,'次， ',alert_level_ma1,'级预警'),
+alert_date_ma=DATE_FORMAT(NOW(),'%Y%m%d'),
+create_time_ma=NOW() WHERE sendtype=0;
+
+####以上为风机级别，已ok
+##################################################################################################################
+
+####风场级别更新，借助中间表
+###该表产生更新alert_level3的数据
+DROP TABLE IF EXISTS t_alert2;
+CREATE TABLE t_alert2 SELECT rules_id,windfarm_id,windfarm,turbine,turbine_id,trigkeys,level1low,level1high,level2low,level2high,level3low,alert_level_ma1,alert_level_ma2,
+alert_level_ma3,num1_trigkey,sum(num1_trigkey) g_fc_num3_trigkey,num3_trigkey,alert_name_ma,alert_type_ma,alert_location_ma,alert_desc_ma,alert_date_ma,create_time_ma,fault_code_ma,
+sendtype FROM result_all WHERE sendtype=1 GROUP BY windfarm_id;
+
+UPDATE t_alert2 SET alert_level_ma3=(case when g_fc_num3_trigkey BETWEEN level1low and level1high then 1 when g_fc_num3_trigkey BETWEEN level2low AND level2high then 2 when g_fc_num3_trigkey>level3low then 3 END) WHERE sendtype=1;
+
+UPDATE result_all,t_alert2 SET result_all.alert_level_ma1=t_alert2.alert_level_ma3 WHERE result_all.rules_id=t_alert2.rules_id AND 
+result_all.windfarm_id=t_alert2.windfarm_id AND result_all.sendtype=1;
+UPDATE result_all,t_alert2 SET result_all.num3_trigkey=t_alert2.g_fc_num3_trigkey WHERE result_all.rules_id=t_alert2.rules_id AND 
+result_all.windfarm_id=t_alert2.windfarm_id AND result_all.sendtype=1;
+
+##########此处需要计算风场下风机的故障产生次数，重复风机更新方法
+###此处有问题，该表只是计算g_fc_num2_trigkey的次数
+DROP TABLE IF EXISTS t_alert2_2;
+CREATE TABLE t_alert2_2 SELECT trigkey_count,rules_id,windfarm_id,windfarm,turbine,turbine_id,trigkeys,level1low,level1high,level2low,level2high,level3low,alert_level_ma1,alert_level_ma2,
+alert_level_ma3,num1_trigkey,sum(num1_trigkey) g_fc_num2_trigkey,num3_trigkey,alert_name_ma,alert_type_ma,alert_location_ma,alert_desc_ma,alert_date_ma,create_time_ma,fault_code_ma,
+sendtype FROM result_all WHERE sendtype=1 GROUP BY turbine_id;
+
+#更新入总表
+UPDATE result_all,t_alert2_2 SET 
+result_all.num2_trigkey=t_alert2_2.g_fc_num2_trigkey WHERE result_all.sendtype=1 AND result_all.windfarm_id=t_alert2_2.windfarm_id AND result_all.turbine_id=t_alert2_2.turbine_id;
+##完成trigkey_count按发风机分组组合
+
+DROP TABLE IF EXISTS t_alert2_3;
+CREATE TABLE t_alert2_3 SELECT * FROM result_all WHERE sendtype=1 ORDER BY num2_trigkey DESC;
+
+
+##借助2_4完成trigkey分组
+DROP TABLE IF EXISTS t_alert2_4;
+CREATE TABLE t_alert2_4 SELECT rules_id,windfarm_id,num2_trigkey,turbine,turbine_id,GROUP_CONCAT(trigkey_count separator '|') fj_cat_trigkey FROM t_alert2_3 GROUP BY turbine_id ORDER BY num2_trigkey DESC;
+
+ALTER TABLE t_alert2_4 ADD new_trigkeys3 VARCHAR(2550);
+
+UPDATE t_alert2_4 SET new_trigkeys3= CONCAT(turbine,'：',num2_trigkey,'次','|',fj_cat_trigkey);
+######完成
+DROP TABLE IF EXISTS t_alert2_5;
+CREATE TABLE t_alert2_5 SELECT rules_id,windfarm_id,turbine_id,GROUP_CONCAT(new_trigkeys3 separator '|') cat_turbine FROM t_alert2_4 GROUP BY windfarm_id;
+####更新到result_all
+ALTER TABLE result_all MODIFY COLUMN fault_code_ma VARCHAR(2550);
+UPDATE result_all,t_alert2_5 SET 
+result_all.alert_name_ma='故障预警',
+result_all.alert_type_ma=5,
+alert_location_ma=CONCAT(result_all.windfarm),
+alert_desc_ma=CONCAT('<',result_all.rules_id,'>','近',result_all.faultDays,'天','，',result_all.windfarm,'：',num3_trigkey,'次， ',alert_level_ma1,'级预警'),
+result_all.fault_code_ma=t_alert2_5.cat_turbine,
+alert_date_ma=DATE_FORMAT(NOW(),'%Y%m%d'),
+result_all.create_time_ma=NOW() WHERE result_all.windfarm_id=t_alert2_5.windfarm_id;
+###分分合合，将中间表转化为结果表整体推送入result表，也许并不需要中间表
+###根据1,2,3,整合各个字段，相应加入风机与风场编号。岂不ok！整体写入。同理，另一种方法也是可以这样做的虽然是部分写入，改进alert_level7.该方法，效率较低，但结果符合要求。（思考！）
+#分分合合,z1,z2,z3为中间表的分解表,合并三张结果表，union all，不去重。
+/*
+DROP table IF EXISTS z1;
+CREATE TABLE z1 SELECT * FROM  result_all WHERE sendtype=2;
+#UPDATE z1 SET fault_code_ma=CONCAT('风场:',windfarm_id,',风机:',turbine_id,',',trigkey_count);
+DROP table IF EXISTS z2;
+CREATE TABLE z2 SELECT * FROM  result_all WHERE sendtype=0 GROUP BY turbine_id;
+#UPDATE z2 SET fault_code_ma=CONCAT('风场:',windfarm_id,',风机:',turbine_id,',',fault_code_ma);
+
+####可以实现，但是好复杂！,在风机记得基础上进行合并字段并更新
+DROP table IF EXISTS z3;
+CREATE TABLE z3 SELECT * FROM  result_all WHERE sendtype=1 GROUP BY windfarm_id;
+#UPDATE z3 SET fault_code_ma=CONCAT('风场:',windfarm_id,'风机:',turbine_id);
+*/
+CREATE TABLE ma SELECT * FROM  result_all WHERE sendtype=2 AND alert_level_ma1 is not NULL UNION ALL SELECT * FROM  result_all WHERE sendtype=0 AND alert_level_ma1 is not NULL GROUP BY turbine_id UNION ALL 
+SELECT * FROM  result_all WHERE sendtype=1 AND alert_level_ma1 is not NULL GROUP BY windfarm_id;
+ALTER TABLE ma add s_date date;
+UPDATE ma SET s_date=SUBDATE(alert_date_ma,INTERVAL faultDays DAY);
+ALTER TABLE result_all add s_date date;
+UPDATE result_all SET s_date=SUBDATE(alert_date_ma,INTERVAL faultDays Day);
+
+###插入最终的结果表
+/*
+INSERT INTO eg_bus_alert_result(
+alert_name,
+alert_level,
+alert_desc,
+alert_location,
+alert_type,
+windfarm,
+alert_date,
+create_time,
+turbine,
+fault_code,
+rules_id) SELECT alert_name_ma,alert_level_ma1,alert_desc_ma,alert_location_ma,alert_type_ma,windfarm_id,alert_date_ma,create_time_ma,turbine,
+fault_code_ma,rules_id from ma WHERE alert_level_ma1 is not null;
+
+
+*/
+###此处需要有drop，一个删除多余表的过程。
+DROP TABLE t_alert1;
+DROP TABLE t_alert1_new;
+DROP TABLE t_alert1_new2;
+DROP TABLE t_alert2;
+DROP TABLE t_alert2_2;
+DROP TABLE t_alert2_3;
+DROP TABLE t_alert2_4;
+DROP TABLE t_alert2_5;
+END
+#########
+update_flag2
+***
+BEGIN
+UPDATE eg_data_lack_ma SET flag2 = 1 WHERE CONCAT(WTURBINE_ID,LACK_DATES) IN (SELECT ct from lack);
+
+END
+#######
+update_history_lack
+****
+
+BEGIN
+###每一次程序运行完，需要更新history_ma 与lack表
+##即删除eg_data_history_ma与eg_data_lack_ma,将新的重新复制，命名eg_data_history_ma与eg_data_lack_ma
+DROP TABLE eg_data_history_ma;
+DROP TABLE eg_data_history_ma;
+TRUNCATE TABLE result_all2;
+DROP TABLE ma;
+DROP TABLE IF EXISTS eg_data_history_ma;
+CREATE TABLE eg_data_history_ma SELECT * FROM eg_data_history;
+ALTER TABLE eg_data_history_ma ADD flag1 INT;
+DROP TABLE IF EXISTS eg_data_lack_ma;
+CREATE TABLE eg_data_lack_ma SELECT * FROM eg_data_lack;
+ALTER TABLE eg_data_lack_ma ADD flag2 INT;
+
+END
